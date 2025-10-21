@@ -1,0 +1,12 @@
+name: Master
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pandas
+  - matplotlib
+  - numpy
+  - scikit-learn
+  - pip
+      - causal-learn
+      - pytorch
