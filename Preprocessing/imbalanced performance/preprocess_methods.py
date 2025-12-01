@@ -1,4 +1,10 @@
 import numpy as np
+from causal_discovery.algos.notears import NoTears
+import networkx as nx
+import hashlib
+import os
+from matplotlib import pyplot as plt
+import pandas as pd
 
 class ModuleLevelInfoInSteps:
     def getRowIndexOfStepIndex(data):
@@ -140,5 +146,169 @@ class HallSensorInSteps:
                 data_insteps.append(np.mean([data[data_col][stepStartEnd[i][1]:stepStartEnd[i][2]]]))
             return data_insteps
         else: print(f'not valid data name, must be in {valid}')
-    
+
+
+class CausalIndividualLevel:
+
+    @staticmethod
+    def observational_struct_learning(cell_list, obs_or_int, save_point, sort_by="Step_Index", type="cell"):
+        os.makedirs(save_point, exist_ok=True)
+        dag_counter = {}
+
+        for idx, cell in enumerate(cell_list):
+
+            cell_dir = os.path.join(save_point, f"{type}_{idx}")
+            os.makedirs(cell_dir, exist_ok=True)
+
+            for group_idx, group in enumerate(cell[obs_or_int]):
+
+                df_cell = group.copy()
+                if df_cell.empty:
+                    continue
+
+                if sort_by in df_cell.columns:
+                    df_cell = df_cell.drop(columns=[sort_by])
+
+                df_cell = df_cell.loc[:, df_cell.nunique() > 1]
+                if df_cell.shape[1] < 2:
+                    continue
+
+                X = df_cell.to_numpy().astype(float)
+                cols = df_cell.columns.tolist()
+
+                no_tears_alg = NoTears(rho=1, alpha=0.1, l1_reg=0, lr=1e-2)
+                no_tears_alg.learn(X)
+                W_est = no_tears_alg.get_result()
+                dag = (np.abs(W_est) > 0.3).astype(int)
+
+                dag_hash = hashlib.md5(dag.tobytes()).hexdigest()
+                dag_counter[dag_hash] = dag_counter.get(dag_hash, 0) + 1
+
+                group_dir = os.path.join(cell_dir, f"group_{group_idx}")
+                os.makedirs(group_dir, exist_ok=True)
+
+                np.save(os.path.join(group_dir, "dag.npy"), dag)
+
+                G = nx.DiGraph()
+                for i, src in enumerate(cols):
+                    for j, tgt in enumerate(cols):
+                        if dag[i, j] == 1:
+                            G.add_edge(src, tgt)
+
+                plt.figure(figsize=(7, 6))
+                pos = nx.spring_layout(G, seed=42)
+                nx.draw(G, pos, with_labels=True, node_size=2000, font_size=10, arrows=True)
+                plt.savefig(os.path.join(group_dir, "dag.png"), dpi=200, bbox_inches="tight")
+                plt.close()
+
+        with open(os.path.join(save_point, "dag_summary.txt"), "w") as f:
+            for h, count in dag_counter.items():
+                f.write(f"{h}: {count}\n")
+
+    @staticmethod
+    def load_and_visualize_unique_dags(save_point):
+        """
+        Reads dag_summary.txt, reconstructs unique DAGs from stored dag.npy files,
+        and shows them visually with their counts.
+        """
+
+        # ---- Load summary ----
+        summary_path = os.path.join(save_point, "dag_summary.txt")
+        if not os.path.exists(summary_path):
+            print("ERROR: No dag_summary.txt found in:", save_point)
+            return
+
+        summary = {}
+        with open(summary_path, "r") as f:
+            for line in f:
+                h, count = line.strip().split(": ")
+                summary[h] = int(count)
+
+        unique_dags = {}
+
+        # ---- Traverse folder structure ----
+        for cell in os.listdir(save_point):
+            cell_path = os.path.join(save_point, cell)
+            if not os.path.isdir(cell_path):
+                continue
+
+            for group in os.listdir(cell_path):
+                group_path = os.path.join(cell_path, group)
+                dag_path = os.path.join(group_path, "dag.npy")
+
+                if not os.path.exists(dag_path):
+                    continue
+
+                dag = np.load(dag_path)
+                dag_hash = hashlib.md5(dag.tobytes()).hexdigest()
+
+                # Only keep DAGs mentioned in the summary
+                if dag_hash in summary:
+                    unique_dags[dag_hash] = dag
+
+        # ---- Visualization ----
+        print("Found", len(unique_dags), "unique DAGs.")
+
+        n = len(unique_dags)
+        plt.figure(figsize=(6 * n, 6))
+
+        for i, (dag_hash, dag) in enumerate(unique_dags.items(), 1):
+            G = nx.DiGraph()
+            num_nodes = dag.shape[0]
+            nodes = [f"X{i}" for i in range(num_nodes)]
+            G.add_nodes_from(nodes)
+
+            for s in range(num_nodes):
+                for t in range(num_nodes):
+                    if dag[s, t] == 1:
+                        G.add_edge(nodes[s], nodes[t])
+
+            plt.subplot(1, n, i)
+            pos = nx.spring_layout(G, seed=0)
+            nx.draw(
+                G,
+                pos,
+                with_labels=True,
+                node_size=2000,
+                font_size=10,
+                arrows=True
+            )
+            plt.title(f"DAG {i}\nHash: {dag_hash[:6]}\nCount: {summary[dag_hash]}")
+
+        plt.tight_layout()
+        plt.show()
+
+        return unique_dags, summary
+
+    @staticmethod
+    def flatten_array(arr):
+        return np.array([x[0] if isinstance(x, (list, np.ndarray)) else x for x in arr])
+
+    @staticmethod
+    def make_cell_dataframe(row, cols):
+        clean = {name: CausalIndividualLevel.flatten_array(row[name]) for name in cols}
+        return pd.DataFrame(clean)
+
+    @staticmethod
+    def splitDataForEachByStep(data, cols, groups, sort_by='Step_Index'):
+        cell_list = []
+        for idx, row in data.iterrows():
+
+            cell_df = CausalIndividualLevel.make_cell_dataframe(row, cols)
+            obs_datasets = []
+            interventional_datasets = []
+
+            for i in range(len(groups)):
+                subset = cell_df[cell_df[sort_by].isin(groups[i])].reset_index(drop=True)
+
+                if i == 0:
+                    obs_datasets.append(subset)
+
+                interventional_datasets.append(subset)
+
+            cell_list.append([obs_datasets, interventional_datasets])
+
+        return cell_list
+
+        
     
