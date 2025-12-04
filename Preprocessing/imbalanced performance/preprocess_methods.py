@@ -5,6 +5,12 @@ import hashlib
 import os
 from matplotlib import pyplot as plt
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import dagma
+from dagma.nonlinear import DagmaMLP, DagmaNonlinear
+import dagma.utils as du
+import torch
+from torch import nn 
 
 class ModuleLevelInfoInSteps:
     def getRowIndexOfStepIndex(data):
@@ -177,7 +183,7 @@ class CausalIndividualLevel:
                 cols = df_cell.columns.tolist()
 
                 no_tears_alg = NoTears(rho=1, alpha=0.1, l1_reg=0, lr=1e-2)
-                no_tears_alg.learn(X)
+                no_tears_alg.learn(X, n_outer_iter=30)
                 W_est = no_tears_alg.get_result()
                 dag = (np.abs(W_est) > 0.3).astype(int)
 
@@ -310,5 +316,250 @@ class CausalIndividualLevel:
 
         return cell_list
 
-        
+    @staticmethod
+    def makeDataFrameOfExperiment(experiments, controlVarIndex, controlVar):
+        experiments_seperated = []
+        for i in controlVar:
+            experiment_data = []
+            for experiment in experiments:
+                #'Test_Times', 'Step_Times', 'Step_Index', 'Cycle_Index', 'VoltageV', 'CurrentA', 'TemperatureC_Cell_1', 'TemperatureC_Cell_2', 'TemperatureC_Cell_3', 'TemperatureC_Cell_4', 
+                # 'Ambient_TemperatureC', 'CurrentA_Cell_1', 'CurrentA_Cell_2', 'CurrentA_Cell_3', 'CurrentA_Cell_4'
+                if(experiment[controlVarIndex]==i):
+                    experiment_info = {
+                        'Test_Times': experiment[5]['Data_processed']["Data"]['Test_Times'], 
+                        'Step_Times': experiment[5]['Data_processed']["Data"]['Step_Times'],
+                        'Cycle_Index': experiment[5]['Data_processed']["Data"]['Cycle_Index'],
+                        'Step_Index': experiment[5]['Data_processed']["Data"]['Step_Index'],
+                        'VoltageV' : experiment[5]['Data_processed']["Data"]['VoltageV'],
+                        'CurrentA' : experiment[5]['Data_processed']["Data"]['CurrentA'],
+                        'TemperatureC_Cell_1' : experiment[5]['Data_processed']["Data"]['TemperatureC_Cell_1'],
+                        'TemperatureC_Cell_2' : experiment[5]['Data_processed']["Data"]['TemperatureC_Cell_2'],
+                        'TemperatureC_Cell_3' : experiment[5]['Data_processed']["Data"]['TemperatureC_Cell_3'],
+                        'TemperatureC_Cell_4' : experiment[5]['Data_processed']["Data"]['TemperatureC_Cell_4'],
+                        'Ambient_TemperatureC' : experiment[5]['Data_processed']["Data"]['Ambient_TemperatureC'],
+                        'CurrentA_Cell_1' : experiment[5]['Data_processed']["Data"]['CurrentA_Cell_1'],
+                        'CurrentA_Cell_2' : experiment[5]['Data_processed']["Data"]['CurrentA_Cell_2'],
+                        'CurrentA_Cell_3' : experiment[5]['Data_processed']["Data"]['CurrentA_Cell_3'],
+                        'CurrentA_Cell_4' : experiment[5]['Data_processed']["Data"]['CurrentA_Cell_4'],
+                    }
+                    experiment_data.append(experiment_info)
+
+            cell_dataset = pd.DataFrame(experiment_data)
+            experiments_seperated.append(cell_dataset)
+        return experiments_seperated
     
+    @staticmethod
+    def multienvcausaldiscoverydataset(data, cols, groups, sort_by='Step_Index'):
+
+        # ---- Map StepIndex values → group number ----
+        mapping = {}
+        for i, group in enumerate(groups):
+            for val in group:
+                mapping[val] = i
+
+        dfs = []  # collect all cell DataFrames here
+
+        for idx, row in data.iterrows():
+            cell_df = CausalIndividualLevel.make_cell_dataframe(row, cols)
+
+            # map StepIndex → group index
+            cell_df["Group"] = cell_df[sort_by].map(mapping)
+
+            # drop original StepIndex
+            cell_df = cell_df.drop(columns=[sort_by])
+
+            dfs.append(cell_df)
+
+        # build final dataset
+        new_df = pd.concat(dfs, ignore_index=True)
+        return new_df
+
+
+    @staticmethod
+    def multienvcausaldiscovery(data, save_point):
+        os.makedirs(save_point, exist_ok=True)
+
+        # --- Remove zero-variance columns ---
+        data = data.loc[:, data.nunique() > 1]
+        if "Group" in data.columns:
+            data = data.drop(columns=["Group"])
+
+        X = data.to_numpy().astype(float)
+        cols = data.columns.tolist()
+
+        # --- Run NoTears ---
+        l1_reg = 0.01
+        alpha = 0.05
+        rho = 0.5
+        no_tears_alg = NoTears(rho=rho, alpha=alpha, l1_reg=l1_reg, lr=2e-5)
+        no_tears_alg.learn(X, n_outer_iter=30,  n_inner_iter=300)
+        W_est = no_tears_alg.get_result()
+        dag = (np.abs(W_est) > 0.3).astype(int)
+        print(dag)
+
+        G = nx.DiGraph()
+        for i, src in enumerate(cols):
+            for j, tgt in enumerate(cols):
+                if dag[i, j] == 1:
+                    G.add_edge(src, tgt)
+
+        plt.figure(figsize=(7, 6))
+        pos = nx.spring_layout(G, seed=42)
+        nx.draw(G, pos, with_labels=True, node_size=2000, font_size=10, arrows=True)
+        plt.savefig(os.path.join(save_point, "dag.png"), dpi=200, bbox_inches="tight")
+        plt.close()
+
+    @staticmethod
+    def multienvcausaldiscoverypergroup(data, save_point):
+        os.makedirs(save_point, exist_ok=True)
+        groups = data["Group"].unique()
+        # --- Remove zero-variance columns ---
+        for index, g in enumerate(groups):
+            os.makedirs(f'{save_point}/{index}', exist_ok=True)
+            subset = data[data["Group"] == g].reset_index(drop=True)
+            #subset = subset.loc[:, subset.nunique() > 1]
+            if "Group" in subset.columns:
+                subset = subset.drop(columns=["Group"])
+
+            X = subset.to_numpy().astype(float)
+            cols = subset.columns.tolist()
+
+            # --- Run NoTears ---
+            l1_reg = 0.01
+            alpha = 0.05
+            rho = 0.5
+            no_tears_alg = NoTears(rho=rho, alpha=alpha, l1_reg=l1_reg, lr=2e-5)
+            no_tears_alg.learn(X, n_outer_iter=30,  n_inner_iter=300)
+            W_est = no_tears_alg.get_result()
+            dag = (np.abs(W_est) > 0.3).astype(int)
+            print(dag)
+
+            G = nx.DiGraph()
+            for i, src in enumerate(cols):
+                for j, tgt in enumerate(cols):
+                    if dag[i, j] == 1:
+                        G.add_edge(src, tgt)
+
+            plt.figure(figsize=(7, 6))
+            pos = nx.spring_layout(G, seed=42)
+            nx.draw(G, pos, with_labels=True, node_size=2000, font_size=10, arrows=True)
+            plt.savefig(os.path.join(f'{save_point}/{index}', "dag.png"), dpi=200, bbox_inches="tight")
+            plt.close()
+
+    @staticmethod
+    def multienvcausaldiscoveryChat(data, save_point):
+        os.makedirs(save_point, exist_ok=True)
+
+        # --- Remove non-causal columns ---
+        #if "Group" in data.columns:
+            #data = data.drop(columns=["Group"])
+
+        # --- Remove zero-variance columns ---
+        data = data.loc[:, data.nunique() > 1]
+        cols = data.columns.tolist()
+        X = data.to_numpy().astype(float)
+        # --- Run NoTears ---
+        dagma_model = DagmaMLP(dims=[4, 16, 16, 4])  # input 4 → hidden → output 4
+        model_nonlinear = DagmaNonlinear(dagma_model)
+        tensor_data = torch.tensor(X, dtype=torch.float32)
+        W_est = model_nonlinear.fit(tensor_data, lambda1 = 0.0005, lambda2=0.0001, lr=5e-4, warm_iter=1000, max_iter=3000)
+
+        print("Learned adjacency matrix:\n", W_est)
+        W = W_est.detach().cpu().numpy()
+        dag = (np.abs(W) > 0.3).astype(int)
+
+        print("Adjacency matrix:")
+        print(dag)
+
+        # --- Draw DAG ---
+        G = nx.DiGraph()
+        for i, src in enumerate(cols):
+            for j, tgt in enumerate(cols):
+                if dag[i, j] == 1:
+                    G.add_edge(src, tgt)
+
+        plt.figure(figsize=(7, 6))
+        pos = nx.spring_layout(G, seed=42)
+        nx.draw(G, pos, with_labels=True, node_size=2000, font_size=10, arrows=True)
+        plt.savefig(os.path.join(save_point, "ChatDag.png"), dpi=200, bbox_inches="tight")
+        plt.close()
+        
+
+
+    @staticmethod
+    def normalize_per_cell(list_of_cell_dfs):
+        scaled_cells = []
+        for df in list_of_cell_dfs:
+            scaler = StandardScaler()
+            scaled = scaler.fit_transform(df.values)
+            scaled_df = pd.DataFrame(scaled, columns=df.columns)
+            scaled_cells.append(scaled_df)
+        return pd.concat(scaled_cells, ignore_index=True)
+    
+    @staticmethod
+    def run_bigdata_notears(df, save_point):
+        os.makedirs(save_point, exist_ok=True)
+        if "Step_Index" in df.columns:
+            df = df.drop(columns=["Step_Index"])
+        
+        X = df.to_numpy().astype(float)
+        cols = df.columns.tolist()
+
+        alg = NoTears(
+            rho=0.5,        # weaker penalty for acyclicity
+            alpha=0.05,     # smaller constraint
+            l1_reg=0.01,    # allow edges to grow
+            lr=1e-3,        # smaller learning rate
+            #h_tol=1e-8,     # more precise DAG constraint
+            #w_threshold=0.2 # cutoff for small weights
+        )
+        
+        alg.learn(
+            X,
+            n_outer_iter=40,    # more iterations
+            n_inner_iter=200,
+            #grad_clip=5.0       # IMPORTANT: stabilizes large data
+        )
+
+        W = alg.get_result()
+        dag = (np.abs(W) > 0.15).astype(int)   # lower threshold
+
+        # Build graph
+        G = nx.DiGraph()
+        for i, src in enumerate(cols):
+            for j, tgt in enumerate(cols):
+                if dag[i, j] == 1:
+                    G.add_edge(src, tgt)
+
+        plt.figure(figsize=(7, 6))
+        pos = nx.spring_layout(G, seed=42)
+        nx.draw(G, pos, with_labels=True, node_size=2000)
+        plt.savefig(os.path.join(save_point, "DAG_bigdata.png"))
+        plt.close()
+
+        return G, W
+
+    @staticmethod
+    def count_edge_frequencies(unique_dags, summary, node_names):
+        """
+        Count how often each directed edge appears across DAGs of potentially different sizes.
+        node_names must be the full list of variable names in consistent order.
+        """
+
+        edge_counts = {}
+        full_dim = len(node_names)
+
+        for dag_hash, dag in unique_dags.items():
+            dag_count = summary[dag_hash]
+            dim = dag.shape[0]  # DAG size for this run
+
+            for i in range(dim):
+                for j in range(dim):
+                    if dag[i, j] == 1:
+                        edge = (node_names[i], node_names[j])
+                        edge_counts[edge] = edge_counts.get(edge, 0) + dag_count
+
+        return edge_counts
+
+
+            
