@@ -459,10 +459,10 @@ class CausalIndividualLevel:
         cols = data.columns.tolist()
         X = data.to_numpy().astype(float)
         # --- Run NoTears ---
-        dagma_model = DagmaMLP(dims=[4, 16, 16, 4])  # input 4 → hidden → output 4
+        dagma_model = DagmaMLP(dims=[4, 16, 1])  # input 4 → hidden → output 1
         model_nonlinear = DagmaNonlinear(dagma_model)
         tensor_data = torch.tensor(X, dtype=torch.float32)
-        W_est = model_nonlinear.fit(tensor_data, lambda1 = 0.0005, lambda2=0.0001, lr=5e-4, warm_iter=1000, max_iter=3000)
+        W_est = model_nonlinear.fit(tensor_data, lambda1 = 0.0005, lambda2=0.0001, lr=5e-4, warm_iter=100, max_iter=3000, T=8)
 
         print("Learned adjacency matrix:\n", W_est)
         W = W_est.detach().cpu().numpy()
