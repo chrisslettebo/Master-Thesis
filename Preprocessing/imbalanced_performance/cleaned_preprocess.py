@@ -20,7 +20,7 @@ class IndividualProcess:
 
         # --- Specific files ---
         cells.append(["GS3", CommonProcesses.load_mat(base + "Aged_cells/HPPC_MS/HPPC_MultiSine_GS3.mat")])
-        cells.append(["Y1",  CommonProcesses.load_mat(base + "Aged_cells/HPPC_MS/HPPC_MultiSine_Y1.mat")])
+        #cells.append(["Y1",  CommonProcesses.load_mat(base + "Aged_cells/HPPC_MS/HPPC_MultiSine_Y1.mat")]) not the same steps, uncertain right now
 
         # --- Load P2–P20 ---
         for i in range(2, 21):
@@ -33,22 +33,24 @@ class IndividualProcess:
         return cells
     
     @staticmethod
-    def getCellDataset():
-        cell_data = []
+    def getLongCellDataset():
+        rows = []
         cells = IndividualProcess.getCells()
-        for cell in cells:
-            cell_info = {
-                'CurrentData': cell[1]['CurrentData'], 
-                'VoltageData': cell[1]['VoltageData'],
-                'TempData': cell[1]['TempData'],
-                'Step_Index': cell[1]['StepIndex'],
-                'CycleIndex' : cell[1]['CycleIndex'],
-                'TimeData' : cell[1]['TimeData']
-            }
-            cell_data.append(cell_info)
 
-        cell_dataset = pd.DataFrame(cell_data)
-        return cell_dataset
+        for cell_name, cell in cells:
+            T = len(cell['CurrentData'])
+            for t in range(T):
+                rows.append({
+                    "CellID": cell_name,
+                    "CurrentData": cell['CurrentData'][t],
+                    "VoltageData": cell['VoltageData'][t],
+                    "TempData": cell['TempData'][t],
+                    "StepIndex": cell['StepIndex'][t],
+                    "CycleIndex": cell['CycleIndex'][t],
+                    "TimeData": cell['TimeData'][t]
+                })
+
+        return pd.DataFrame(rows)
 
 
 class CommonProcesses:
@@ -119,85 +121,32 @@ class CommonProcesses:
             cell_list.append([obs_datasets, interventional_datasets])
         return cell_list
     
-    @staticmethod
-    def multienvcausaldiscoverydataset(data, cols, groups, sort_by='Step_Index'):
-
-        # ---- Map StepIndex values → group number ----
-        mapping = {}
-        for i, group in enumerate(groups):
-            for val in group:
-                mapping[val] = i
-
-        dfs = []  # collect all cell DataFrames here
-        null_info = []  # collect info about rows where mapping failed
-
-        for idx, row in data.iterrows():
-            cell_df = CommonProcesses.make_cell_dataframe(row, cols)
-
-            # map StepIndex → group index
-            cell_df["Group"] = cell_df[sort_by].map(mapping)
-
-                # check for nulls created by mapping
-            if cell_df["Group"].isnull().any():
-                null_rows = cell_df[cell_df["Group"].isnull()]
-                null_info.append((idx, null_rows))  # store original Step_Index values causing NaN
-
-            # drop original StepIndex
-            cell_df = cell_df.drop(columns=[sort_by])
-
-            dfs.append(cell_df)
-
-        # build final dataset
-        new_df = pd.concat(dfs, ignore_index=True)
-
-
-        if null_info:
-            print("Warning: Some rows could not be mapped to groups:")
-            for row_idx, missing_values in null_info:
-                print(f"Original data row {row_idx} has unmapped {sort_by} values:\n{missing_values}")
-        return new_df
     
     @staticmethod
-    def envcausaldiscoverydataset(data, cols, groups, sort_by='Step_Index'):
-
-        # ---- Map StepIndex values → group number ----
+    def envcausaldiscoverydataset(data, cols, groups, step_col="StepIndex"):
+        # Map StepIndex → group index
         mapping = {}
         for i, group in enumerate(groups):
             for val in group:
                 mapping[val] = i
 
-        dfs = []  # collect all cell DataFrames here
-        null_info = []  # collect info about rows where mapping failed
+        data = data.copy()
+        data["Group"] = data[step_col].map(mapping)
 
-        for idx, row in data.iterrows():
-            cell_df = CommonProcesses.make_cell_dataframe(row, cols)
+        # Check unmapped steps
+        if data["Group"].isnull().any():
+            unmapped = data[data["Group"].isnull()][step_col].unique()
+            raise ValueError(f"Unmapped StepIndex values: {unmapped}")
 
-            # map StepIndex → group index
-            cell_df["Group"] = cell_df[sort_by].map(mapping)
+        # Drop non-causal columns
+        drop_cols = [step_col, "TimeData"]
+        data = data.drop(columns=[c for c in drop_cols if c in data.columns])
 
-                # check for nulls created by mapping
-            if cell_df["Group"].isnull().any():
-                null_rows = cell_df[cell_df["Group"].isnull()]
-                null_info.append((idx, null_rows))  # store original Step_Index values causing NaN
-
-            # drop original StepIndex
-            cell_df = cell_df.drop(columns=[sort_by])
-
-            dfs.append(cell_df)
-
-        # build final dataset
-        new_df = pd.concat(dfs, ignore_index=True)
-        #scaled_df = CommonProcesses.scale_data_shared(new_df.values)
+        # Build environment dict
         env_dfs = {}
+        for g in sorted(data["Group"].unique()):
+            env_dfs[str(g)] = data[data["Group"] == g][cols].copy()
 
-        for group in new_df["Group"].unique():
-            env_dfs[group] = new_df[new_df["Group"] == group].copy()
-
-
-        if null_info:
-            print("Warning: Some rows could not be mapped to groups:")
-            for row_idx, missing_values in null_info:
-                print(f"Original data row {row_idx} has unmapped {sort_by} values:\n{missing_values}")
         return env_dfs
 
 
@@ -227,6 +176,38 @@ class ModularProcesses:
                 experiments.append([c, a, r, t, m, data])
 
         return experiments
+    
+    @staticmethod
+    def getLongCellDatasetModular():
+        rows = []
+        experiments = ModularProcesses.getExperiments()
+
+        for c, a, r, t, m, data in experiments:
+            L = len(data['Data_processed']["Data"]['CurrentA'])
+            for i in range(L):
+                rows.append({
+                    'Cell': c,
+                    'aged': a,
+                    'Resistance': r,
+                    'Temp': t,
+                    'TestTimes': data['Data_processed']["Data"]['Test_Times'][i], 
+                    'StepTimes': data['Data_processed']["Data"]['Step_Times'][i],
+                    'CycleIndex': data['Data_processed']["Data"]['Cycle_Index'][i],
+                    'StepIndex': data['Data_processed']["Data"]['Step_Index'][i],
+                    'VoltageV' : data['Data_processed']["Data"]['VoltageV'][i],
+                    'CurrentA' : data['Data_processed']["Data"]['CurrentA'][i],
+                    'TemperatureC_Cell_1' : data['Data_processed']["Data"]['TemperatureC_Cell_1'][i],
+                    'TemperatureC_Cell_2' : data['Data_processed']["Data"]['TemperatureC_Cell_2'][i],
+                    'TemperatureC_Cell_3' : data['Data_processed']["Data"]['TemperatureC_Cell_3'][i],
+                    'TemperatureC_Cell_4' : data['Data_processed']["Data"]['TemperatureC_Cell_4'][i],
+                    'Ambient_TemperatureC' : data['Data_processed']["Data"]['Ambient_TemperatureC'][i],
+                    'CurrentA_Cell_1' : data['Data_processed']["Data"]['CurrentA_Cell_1'][i],
+                    'CurrentA_Cell_2' : data['Data_processed']["Data"]['CurrentA_Cell_2'][i],
+                    'CurrentA_Cell_3' : data['Data_processed']["Data"]['CurrentA_Cell_3'][i],
+                    'CurrentA_Cell_4' : data['Data_processed']["Data"]['CurrentA_Cell_4'][i],
+                })
+
+        return pd.DataFrame(rows)
 
     @staticmethod
     def getExperimentDataSet():
@@ -293,4 +274,3 @@ class ModularProcesses:
 
         cell_dataset = pd.DataFrame(experiment_data)
         return cell_dataset
-    
